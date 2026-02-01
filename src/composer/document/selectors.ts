@@ -1,5 +1,5 @@
 import type { NodeId } from './ids.js';
-import type { DocumentModel, NodeRecord, Edge } from './model.js';
+import type { DocumentModel, NodeRecord, Edge, ScriptAttachment } from './model.js';
 import { getChildrenInSlot, getAllChildren, getLayoutSlots, getDefaultSlot } from './model.js';
 
 // ---------------------------------------------------------------------------
@@ -104,6 +104,7 @@ export interface NodeDescription {
   props: Record<string, any>;
   styleTokens: string[];
   events?: Record<string, any>;
+  script?: ScriptAttachment;
   childrenBySlot: Record<string, { id: NodeId; name?: string; kind: string }[]>;
 }
 
@@ -130,6 +131,7 @@ export function describeNode(doc: DocumentModel, id: NodeId): NodeDescription | 
     props: node.props,
     styleTokens: node.styleTokens,
     events: node.events,
+    script: node.script,
     childrenBySlot,
   };
 }

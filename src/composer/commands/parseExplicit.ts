@@ -67,6 +67,27 @@ function tokenize(input: string): Token[] {
     if (ch === ']') { tokens.push({ type: 'RBRACKET', value: ']', pos: i }); i++; continue; }
     if (ch === ',') { tokens.push({ type: 'COMMA', value: ',', pos: i }); i++; continue; }
 
+    // Triple-quote raw string: """..."""
+    if (ch === '"' && input[i + 1] === '"' && input[i + 2] === '"') {
+      const start = i;
+      i += 3; // skip opening """
+      // Skip one leading newline if present
+      if (i < input.length && input[i] === '\n') i++;
+      else if (i < input.length && input[i] === '\r' && input[i + 1] === '\n') i += 2;
+      let s = '';
+      while (i < input.length) {
+        if (input[i] === '"' && input[i + 1] === '"' && input[i + 2] === '"') break;
+        s += input[i];
+        i++;
+      }
+      if (i < input.length) i += 3; // skip closing """
+      // Trim one trailing newline
+      if (s.endsWith('\r\n')) s = s.slice(0, -2);
+      else if (s.endsWith('\n')) s = s.slice(0, -1);
+      tokens.push({ type: 'STRING', value: s, pos: start });
+      continue;
+    }
+
     // Strings
     if (ch === '"' || ch === "'") {
       const quote = ch;
@@ -105,8 +126,9 @@ function tokenize(input: string): Token[] {
       continue;
     }
 
-    // Identifiers (including booleans)
-    if (/[a-zA-Z_]/.test(ch)) {
+    // Identifiers (including booleans) — also handle leading hyphen for
+    // Tailwind negative classes like -z-10, -translate-x-1/2
+    if (/[a-zA-Z_]/.test(ch) || (ch === '-' && i + 1 < input.length && /[a-zA-Z]/.test(input[i + 1]))) {
       const start = i;
       while (i < input.length && /[a-zA-Z0-9_\-.]/.test(input[i])) i++;
       const word = input.slice(start, i);
@@ -166,6 +188,28 @@ export type ParsedCommand =
   | { type: 'export'; kind: string; target: string; path?: string }
   | { type: 'import'; kind: string; source: string; data?: any }
   | { type: 'help'; topic?: string }
+  | { type: 'scriptSet'; target?: ParsedTarget; source?: string }
+  | { type: 'scriptEnd' }
+  | { type: 'scriptShow'; target?: ParsedTarget }
+  | { type: 'scriptClear'; target?: ParsedTarget }
+  | { type: 'fsmDefine'; name: string; initialState: string }
+  | { type: 'fsmState'; fsmName: string; stateName: string; transitions: { event: string; target: string }[] }
+  | { type: 'fsmShow'; name?: string }
+  | { type: 'fsmDelete'; name: string }
+  | { type: 'fsmList' }
+  | { type: 'routeAdd'; name: string; pattern: string }
+  | { type: 'routeRemove'; name: string }
+  | { type: 'routeGoto'; path: string; replace?: boolean }
+  | { type: 'routeList' }
+  | { type: 'routeWhere' }
+  | { type: 'screenSet'; routeName: string; nodeName: string }
+  | { type: 'historyCompact'; mode: 'preview' | 'apply' }
+  | { type: 'macroDefine'; name: string; from: string }
+  | { type: 'macroParams'; name: string; params: string[] }
+  | { type: 'macroShow'; name: string }
+  | { type: 'macroList' }
+  | { type: 'macroDelete'; name: string }
+  | { type: 'use'; name: string; bindings: { key: string; value: any }[] }
   | { type: 'comment'; text: string }
   | { type: 'error'; message: string; input: string };
 
@@ -299,6 +343,13 @@ class Parser {
       case 'export': return this.parseExport();
       case 'import': return this.parseImport();
       case 'help': return this.parseHelp();
+      case 'script': return this.parseScript();
+      case 'fsm': return this.parseFSM();
+      case 'route': return this.parseRoute();
+      case 'screen': return this.parseScreen();
+      case 'history': return this.parseHistory();
+      case 'macro': return this.parseMacro();
+      case 'use': return this.parseUse();
       default:
         this.advance();
         return { type: 'error', message: `Unknown command: ${tok.value}`, input: tok.value };
@@ -580,7 +631,7 @@ class Parser {
   private parseExport(): ParsedCommand {
     this.advance();
     let kind = 'log';
-    let target = 'clipboard';
+    let target = 'console';
     let path: string | undefined;
     if (this.check('IDENT')) kind = this.advance().value;
     if (this.check('IDENT')) {
@@ -615,7 +666,214 @@ class Parser {
     this.advance();
     let topic: string | undefined;
     if (this.check('IDENT')) topic = this.advance().value;
+    // Consume any remaining words on the line so they don't leak as separate commands
+    while (!this.atLineEnd() && (this.check('IDENT') || this.check('STRING') || this.check('FLAG'))) {
+      this.advance();
+    }
     return { type: 'help', topic };
+  }
+
+  // ---- Script ----
+  private parseScript(): ParsedCommand {
+    this.advance(); // consume 'script'
+    if (this.atLineEnd()) return { type: 'help', topic: 'script' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'set': {
+        let target: ParsedTarget | undefined;
+        if (!this.atLineEnd()) target = this.parseTarget();
+        let source: string | undefined;
+        if (this.check('STRING')) {
+          source = this.advance().value;
+        }
+        return { type: 'scriptSet', target, source };
+      }
+      case 'end':
+        return { type: 'scriptEnd' };
+      case 'show': {
+        let target: ParsedTarget | undefined;
+        if (!this.atLineEnd()) target = this.parseTarget();
+        return { type: 'scriptShow', target };
+      }
+      case 'clear': {
+        let target: ParsedTarget | undefined;
+        if (!this.atLineEnd()) target = this.parseTarget();
+        return { type: 'scriptClear', target };
+      }
+      default:
+        return { type: 'error', message: `Unknown script subcommand: ${sub}`, input: `script ${sub}` };
+    }
+  }
+
+  // ---- FSM ----
+  private parseFSM(): ParsedCommand {
+    this.advance(); // consume 'fsm'
+    if (this.atLineEnd()) return { type: 'help', topic: 'fsm' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'define': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        this.expectValue('initial');
+        const initialState = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'fsmDefine', name, initialState };
+      }
+      case 'state': {
+        const fsmName = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        const stateName = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        const transitions: { event: string; target: string }[] = [];
+        while (this.checkValue('on') && !this.atLineEnd()) {
+          this.advance(); // consume 'on'
+          const event = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+          const target = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+          transitions.push({ event, target });
+        }
+        return { type: 'fsmState', fsmName, stateName, transitions };
+      }
+      case 'show': {
+        let name: string | undefined;
+        if (!this.atLineEnd()) {
+          name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        }
+        return { type: 'fsmShow', name };
+      }
+      case 'delete': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'fsmDelete', name };
+      }
+      case 'list':
+        return { type: 'fsmList' };
+      default:
+        return { type: 'error', message: `Unknown fsm subcommand: ${sub}`, input: `fsm ${sub}` };
+    }
+  }
+
+  // ---- Route ----
+  private parseRoute(): ParsedCommand {
+    this.advance(); // consume 'route'
+    if (this.atLineEnd()) return { type: 'help', topic: 'route' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'add': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        const pattern = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'routeAdd', name, pattern };
+      }
+      case 'remove': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'routeRemove', name };
+      }
+      case 'goto': {
+        const path = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        let replace = false;
+        if (this.check('FLAG') && this.peek().value === '--replace') {
+          this.advance();
+          replace = true;
+        }
+        return { type: 'routeGoto', path, replace };
+      }
+      case 'list':
+        return { type: 'routeList' };
+      case 'where':
+        return { type: 'routeWhere' };
+      default:
+        return { type: 'error', message: `Unknown route subcommand: ${sub}`, input: `route ${sub}` };
+    }
+  }
+
+  // ---- Screen ----
+  private parseScreen(): ParsedCommand {
+    this.advance(); // consume 'screen'
+    if (this.atLineEnd()) return { type: 'help', topic: 'screen' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'set': {
+        const routeName = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        const nodeName = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'screenSet', routeName, nodeName };
+      }
+      default:
+        return { type: 'error', message: `Unknown screen subcommand: ${sub}`, input: `screen ${sub}` };
+    }
+  }
+
+  // ---- History ----
+  private parseHistory(): ParsedCommand {
+    this.advance(); // consume 'history'
+    if (this.atLineEnd()) return { type: 'help', topic: 'history' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'compact': {
+        let mode: 'preview' | 'apply' = 'preview';
+        if (this.check('FLAG')) {
+          const flag = this.advance().value;
+          if (flag === '--apply') mode = 'apply';
+          // --preview is the default, no change needed
+        }
+        return { type: 'historyCompact', mode };
+      }
+      default:
+        return { type: 'error', message: `Unknown history subcommand: ${sub}`, input: `history ${sub}` };
+    }
+  }
+
+  // ---- Macro ----
+  private parseMacro(): ParsedCommand {
+    this.advance(); // consume 'macro'
+    if (this.atLineEnd()) return { type: 'help', topic: 'macro' };
+    const sub = this.expect('IDENT').value;
+    switch (sub) {
+      case 'define': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        this.expectValue('from');
+        const from = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'macroDefine', name, from };
+      }
+      case 'params': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        const params: string[] = [];
+        while (!this.atLineEnd()) {
+          if (this.check('IDENT')) {
+            params.push(this.advance().value);
+          } else if (this.check('STRING')) {
+            params.push(this.advance().value);
+          } else break;
+        }
+        return { type: 'macroParams', name, params };
+      }
+      case 'show': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'macroShow', name };
+      }
+      case 'list':
+        return { type: 'macroList' };
+      case 'delete': {
+        const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+        return { type: 'macroDelete', name };
+      }
+      default:
+        return { type: 'error', message: `Unknown macro subcommand: ${sub}`, input: `macro ${sub}` };
+    }
+  }
+
+  // ---- Use ----
+  private parseUse(): ParsedCommand {
+    this.advance(); // consume 'use'
+    if (this.atLineEnd()) return { type: 'help', topic: 'use' };
+    const name = this.check('STRING') ? this.advance().value : this.expect('IDENT').value;
+    const bindings: { key: string; value: any }[] = [];
+    while (!this.atLineEnd()) {
+      if (this.check('IDENT')) {
+        const key = this.advance().value;
+        if (this.match('EQUALS')) {
+          const value = this.parsePropValue();
+          bindings.push({ key, value });
+        } else {
+          // bare key with no value — treat as true
+          bindings.push({ key, value: true });
+        }
+      } else break;
+    }
+    return { type: 'use', name, bindings };
   }
 
   // ---- Shared pieces ----
@@ -729,9 +987,20 @@ class Parser {
           if (this.check('STRING')) {
             tokens.push({ key, value: this.advance().value });
           } else if (this.check('NUMBER')) {
-            tokens.push({ key, value: Number(this.advance().value) });
+            let val = this.advance().value;
+            // Consume bracket notation following number (e.g. arbitrary Tailwind values)
+            val = this.consumeStyleBrackets(val);
+            tokens.push({ key, value: val });
           } else if (this.check('IDENT')) {
-            tokens.push({ key, value: this.advance().value });
+            let value = this.advance().value;
+            // Consume bracket notation (e.g. tw:max-w-[60ch])
+            value = this.consumeStyleBrackets(value);
+            // Continue reading colon-separated segments for multi-part tokens
+            // like tw:hover:scale-105, tw:md:flex, tw:hover:shadow-xl
+            value = this.consumeStyleColonContinuation(value);
+            // Consume slash-opacity (e.g. tw:bg-slate-950/55)
+            value = this.consumeStyleSlash(value);
+            tokens.push({ key, value });
           } else {
             tokens.push({ key });
           }
@@ -745,9 +1014,79 @@ class Parser {
     return tokens;
   }
 
+  /** Consume :IDENT/:NUMBER continuations for Tailwind modifier chains */
+  private consumeStyleColonContinuation(value: string): string {
+    while (this.check('COLON')) {
+      const savedPos = this.pos;
+      this.advance(); // consume ':'
+      if (this.check('IDENT')) {
+        let segment = this.advance().value;
+        segment = this.consumeStyleBrackets(segment);
+        value += ':' + segment;
+      } else if (this.check('NUMBER')) {
+        value += ':' + this.advance().value;
+      } else {
+        this.pos = savedPos; // rewind — colon belongs to something else
+        break;
+      }
+    }
+    // After all colon segments, check for slash-opacity
+    value = this.consumeStyleSlash(value);
+    return value;
+  }
+
+  /** Consume /NUMBER or /IDENT for Tailwind opacity values like bg-slate-950/55 */
+  private consumeStyleSlash(value: string): string {
+    if (this.check('SLASH')) {
+      const savedPos = this.pos;
+      this.advance(); // consume '/'
+      if (this.check('NUMBER')) {
+        value += '/' + this.advance().value;
+      } else if (this.check('IDENT')) {
+        value += '/' + this.advance().value;
+      } else {
+        this.pos = savedPos; // rewind — slash is a path separator
+      }
+    }
+    return value;
+  }
+
+  /** Consume [...] bracket notation for arbitrary Tailwind values like max-w-[60ch] */
+  private consumeStyleBrackets(value: string): string {
+    if (this.check('LBRACKET')) {
+      this.advance(); // consume '['
+      let inner = '';
+      while (!this.atLineEnd() && !this.check('RBRACKET')) {
+        inner += this.advance().value;
+      }
+      if (this.check('RBRACKET')) {
+        this.advance(); // consume ']'
+      }
+      value += '[' + inner + ']';
+    }
+    return value;
+  }
+
   private parseOptionValue(): string | number | boolean {
     if (this.check('STRING')) return this.advance().value;
-    if (this.check('NUMBER')) return Number(this.advance().value);
+    if (this.check('NUMBER')) {
+      const num = this.advance().value;
+      // Handle compound values like "2xl", "3xl", "5xl" where the tokenizer
+      // splits the number and identifier suffix into separate tokens.
+      // But don't consume the IDENT if it's actually the next option key
+      // (i.e. followed by '=') or a keyword like 'style', 'as', 'named'.
+      if (this.check('IDENT')) {
+        const nextNext = this.tokens[this.pos + 1];
+        const nextVal = this.peek().value;
+        const isNextKey = nextNext?.type === 'EQUALS';
+        const isKeyword = nextVal === 'style' || nextVal === 'as' || nextVal === 'named';
+        if (!isNextKey && !isKeyword) {
+          const suffix = this.advance().value;
+          return num + suffix;
+        }
+      }
+      return Number(num);
+    }
     if (this.check('BOOLEAN')) return this.advance().value === 'true';
     if (this.check('IDENT')) return this.advance().value;
     throw new Error(`Expected option value at pos ${this.peek().pos}`);
@@ -756,7 +1095,20 @@ class Parser {
   private parsePropValue(): any {
     if (this.check('LBRACE') || this.check('LBRACKET')) return this.parseJSON();
     if (this.check('STRING')) return this.advance().value;
-    if (this.check('NUMBER')) return Number(this.advance().value);
+    if (this.check('NUMBER')) {
+      const num = this.advance().value;
+      // Handle compound values like "2xl" where tokenizer splits number + ident.
+      // But don't consume the IDENT if it's actually the next prop key
+      // (i.e. followed by '=').
+      if (this.check('IDENT')) {
+        const nextNext = this.tokens[this.pos + 1];
+        if (nextNext?.type !== 'EQUALS') {
+          const suffix = this.advance().value;
+          return num + suffix;
+        }
+      }
+      return Number(num);
+    }
     if (this.check('BOOLEAN')) return this.advance().value === 'true';
     if (this.check('IDENT')) return this.advance().value;
     throw new Error(`Expected prop value at pos ${this.peek().pos}`);

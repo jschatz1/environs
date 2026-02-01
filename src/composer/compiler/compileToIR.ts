@@ -4,6 +4,8 @@ import { getChildrenInSlot, getLayoutSlots } from '../document/model.js';
 import { compileLayoutClasses } from '../layout/primitives.js';
 import { compileTokens } from '../style/tokens.js';
 import { KIND_DEFAULTS, KIND_TAGS } from '../style/defaults.js';
+import { parseRichText } from './richText.js';
+import { expandRepeatToIR } from './repeatIR.js';
 
 // ---------------------------------------------------------------------------
 // IR types
@@ -13,6 +15,7 @@ export interface IRNode {
   id: string;         // NodeId or generated slot-wrapper id
   tag: string;
   text?: string;
+  richText?: string;  // pre-rendered HTML when text contains [link](url) syntax
   classes: string;
   attrs: Record<string, string>;
   isSlotWrapper?: boolean;
@@ -43,7 +46,13 @@ export function compileToIR(doc: DocumentModel): IR {
     const node = doc.nodes.get(nodeId);
     if (!node) return;
 
-    const tag = node.tag ?? KIND_TAGS[node.kind] ?? 'div';
+    let tag = node.tag ?? KIND_TAGS[node.kind] ?? 'div';
+    if (node.kind === 'button' && node.props.href) {
+      tag = 'a';
+    }
+    if (node.layout?.type === 'paragraph') {
+      tag = 'p';
+    }
 
     // Compute classes: layout classes + kind defaults + token classes
     const classParts: string[] = [];
@@ -80,16 +89,32 @@ export function compileToIR(doc: DocumentModel): IR {
       attrs['src'] = node.props.src;
       if (node.props.alt) attrs['alt'] = node.props.alt;
     }
+    if (node.kind === 'link') {
+      if (node.props.href) attrs['href'] = node.props.href;
+      if (node.props.target) attrs['target'] = node.props.target;
+    }
+    if (node.kind === 'button' && node.props.href) {
+      attrs['href'] = node.props.href;
+      if (node.props.target) attrs['target'] = node.props.target;
+    }
 
     // Text content
     let text: string | undefined;
-    if (node.props.text !== undefined) text = String(node.props.text);
+    let richText: string | undefined;
+    if (node.props.text !== undefined) {
+      text = String(node.props.text);
+      const parsed = parseRichText(text);
+      if (parsed.hasLinks) {
+        richText = parsed.html;
+      }
+    }
 
     // Create the IR node
     const irNode: IRNode = {
       id: nodeId,
       tag,
       text,
+      richText,
       classes,
       attrs,
       sourceNodeId: nodeId,
@@ -106,10 +131,11 @@ export function compileToIR(doc: DocumentModel): IR {
       for (const slot of slots) {
         const wrapperId = `${nodeId}::slot::${slot}`;
         const wrapperClasses = layoutClasses.slotWrappers[slot] ?? '';
+        const wrapperTag = node.layout!.type === 'paragraph' ? 'span' : 'div';
 
         nodes.set(wrapperId, {
           id: wrapperId,
-          tag: 'div',
+          tag: wrapperTag,
           classes: wrapperClasses,
           attrs: {},
           isSlotWrapper: true,
@@ -117,6 +143,11 @@ export function compileToIR(doc: DocumentModel): IR {
         });
 
         placements.push({ parentIRId: nodeId, childIRId: wrapperId, order: slots.indexOf(slot) });
+
+        // Repeat layout: expand items from signal via template macro
+        if (node.layout!.type === 'repeat' && slot === 'content') {
+          expandRepeatToIR(nodeId, node, doc, wrapperId, { nodes, placements });
+        }
 
         // Place children of this slot into the wrapper
         const children = getChildrenInSlot(doc, nodeId, slot);

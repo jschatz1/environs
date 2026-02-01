@@ -60,6 +60,18 @@ export function createDOMBackend(root: HTMLElement): DOMBackend {
           }
           break;
         }
+        case 'updateRichText': {
+          const el = elements.get(op.id);
+          if (el) {
+            if (op.html) {
+              el.innerHTML = op.html;
+            } else {
+              // Rich text removed — fall back to plain text
+              el.innerHTML = '';
+            }
+          }
+          break;
+        }
         case 'updateClasses': {
           const el = elements.get(op.id);
           if (el) el.className = op.classes;
@@ -100,7 +112,7 @@ export function createDOMBackend(root: HTMLElement): DOMBackend {
     }
     for (const [parentId, list] of byParent) {
       list.sort((a, b) => a.order - b.order);
-      const parentEl = parentId === 'root' ? root : elements.get(parentId);
+      const parentEl = elements.get(parentId) ?? root;
       if (!parentEl) continue;
 
       for (const { childId, order } of list) {
@@ -146,7 +158,11 @@ export function createDOMBackend(root: HTMLElement): DOMBackend {
       elements.set(node.id, el);
     }
     el.className = node.classes;
-    if (node.text) el.textContent = node.text;
+    if (node.richText) {
+      el.innerHTML = node.richText;
+    } else if (node.text) {
+      el.textContent = node.text;
+    }
     for (const [key, val] of Object.entries(node.attrs)) {
       el.setAttribute(key, val);
     }

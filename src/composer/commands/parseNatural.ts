@@ -10,8 +10,8 @@ export interface NLResult {
   confidence: number;    // 0-1, how confident the mapping is
 }
 
-const KIND_KEYWORDS = ['sidebar', 'menu', 'card', 'button', 'input', 'text', 'divider', 'image', 'container'];
-const LAYOUT_KEYWORDS = ['sidebar', 'stack', 'grid', 'center', 'split', 'tabs'];
+const KIND_KEYWORDS = ['sidebar', 'menu', 'card', 'button', 'input', 'text', 'divider', 'image', 'container', 'link'];
+const LAYOUT_KEYWORDS = ['sidebar', 'stack', 'grid', 'center', 'split', 'tabs', 'paragraph'];
 
 export function parseNatural(input: string): NLResult {
   const lower = input.toLowerCase().trim();

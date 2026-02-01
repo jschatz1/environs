@@ -5,12 +5,13 @@
 import type { ParsedCommand, ParsedStatement, ParsedSlotPath, ParsedTarget, ParsedStyleToken } from './parseExplicit.js';
 import type { DocCommand, EditorCommand, Command } from './types.js';
 import type { CommandBus } from './bus.js';
-import type { DocumentModel, NodeRecord } from '../document/model.js';
+import type { DocumentModel, NodeRecord, TemplateNode } from '../document/model.js';
 import type { NodeId } from '../document/ids.js';
 import { resolveTarget } from '../document/selectors.js';
 import { getDefaultSlot } from '../document/model.js';
 import type { LayoutType, NodeKind } from '../document/model.js';
 import { compileTokens } from '../style/tokens.js';
+import { captureTemplate, expandTemplate } from '../macro/expand.js';
 
 export interface ExecutionContext {
   bus: CommandBus;
@@ -23,6 +24,7 @@ export interface ExecutionResult {
   editorCommands: EditorCommand[];
   errors: string[];
   transcript: string[];
+  scriptCaptureTarget?: NodeId;
 }
 
 export function executeStatement(
@@ -62,7 +64,7 @@ export function executeStatement(
         type: 'CreateNode',
         id,
         kind: cmd.kind as NodeKind,
-        name: cmd.as ?? cmd.label,
+        name: cmd.as ?? id,
         initialProps: cmd.label ? { text: cmd.label } : {},
         initialStyleTokens: cmd.style ? cmd.style.map(tokenToString) : [],
       };
@@ -250,6 +252,306 @@ export function executeStatement(
       result.editorCommands.push({ type: 'Help', topic: cmd.topic });
       break;
 
+    case 'scriptSet': {
+      const targetId = resolveCommandTarget(cmd.target, doc, scopeId, ctx.selectedId);
+      if (!targetId) {
+        result.errors.push('No target for script set — select a node or provide a target');
+        break;
+      }
+      const node = doc.nodes.get(targetId);
+      if (cmd.source !== undefined) {
+        // Inline script — emit ScriptSet command directly
+        const source = cmd.source.trim();
+        if (source) {
+          result.docCommands.push({
+            type: 'ScriptSet',
+            id: targetId,
+            language: 'js',
+            source,
+          });
+          const lineCount = source.split('\n').length;
+          result.transcript.push(`Script set on ${node?.name ?? targetId} (${lineCount} line${lineCount !== 1 ? 's' : ''})`);
+        } else {
+          result.errors.push(`Empty inline script for ${node?.name ?? targetId}`);
+        }
+      } else {
+        // No inline source — enter capture mode
+        result.scriptCaptureTarget = targetId;
+        result.transcript.push(`Entering script capture mode for ${node?.name ?? targetId}`);
+      }
+      break;
+    }
+
+    case 'scriptEnd': {
+      result.transcript.push('script end (no active capture)');
+      break;
+    }
+
+    case 'scriptShow': {
+      const targetId = resolveCommandTarget(cmd.target, doc, scopeId, ctx.selectedId);
+      if (!targetId) {
+        result.errors.push('No target for script show');
+        break;
+      }
+      const node = doc.nodes.get(targetId);
+      if (node?.script) {
+        result.transcript.push(`Script on ${node.name ?? targetId} (${node.script.language}, v${node.script.version}):`);
+        for (const line of node.script.source.split('\n')) {
+          result.transcript.push(`  ${line}`);
+        }
+      } else {
+        result.transcript.push(`No script on ${node?.name ?? targetId}`);
+      }
+      break;
+    }
+
+    case 'scriptClear': {
+      const targetId = resolveCommandTarget(cmd.target, doc, scopeId, ctx.selectedId);
+      if (!targetId) {
+        result.errors.push('No target for script clear');
+        break;
+      }
+      const node = doc.nodes.get(targetId);
+      result.docCommands.push({ type: 'ScriptClear', id: targetId });
+      result.transcript.push(`Cleared script on ${node?.name ?? targetId}`);
+      break;
+    }
+
+    case 'fsmDefine': {
+      result.docCommands.push({
+        type: 'DefineFSM',
+        name: cmd.name,
+        initialState: cmd.initialState,
+      });
+      result.transcript.push(`Defined FSM "${cmd.name}" (initial: ${cmd.initialState})`);
+      break;
+    }
+
+    case 'fsmState': {
+      const fsm = doc.fsms.get(cmd.fsmName);
+      if (!fsm) {
+        result.errors.push(`FSM "${cmd.fsmName}" not found — define it first with: fsm define ${cmd.fsmName} initial <state>`);
+        break;
+      }
+      const transitions: Record<string, string> = {};
+      for (const t of cmd.transitions) {
+        transitions[t.event] = t.target;
+      }
+      result.docCommands.push({
+        type: 'FSMAddTransitions',
+        name: cmd.fsmName,
+        stateName: cmd.stateName,
+        transitions,
+      });
+      const desc = cmd.transitions.map(t => `${t.event} → ${t.target}`).join(', ');
+      result.transcript.push(`State "${cmd.stateName}" in "${cmd.fsmName}": ${desc || '(no transitions)'}`);
+      break;
+    }
+
+    case 'fsmShow': {
+      if (cmd.name) {
+        const fsm = doc.fsms.get(cmd.name);
+        if (!fsm) {
+          result.errors.push(`FSM "${cmd.name}" not found`);
+          break;
+        }
+        result.transcript.push(`FSM: ${fsm.name}`);
+        result.transcript.push(`Initial: ${fsm.initialState}`);
+        result.transcript.push('');
+        for (const state of fsm.states) {
+          const transitions = state.on ? Object.entries(state.on) : [];
+          if (transitions.length === 0) {
+            result.transcript.push(`  ${state.name}`);
+          } else {
+            result.transcript.push(`  ${state.name}`);
+            for (const [event, target] of transitions) {
+              const targetName = typeof target === 'string' ? target : target.target;
+              result.transcript.push(`    ${event} → ${targetName}`);
+            }
+          }
+        }
+      } else {
+        // Show all FSMs
+        if (doc.fsms.size === 0) {
+          result.transcript.push('No FSMs defined');
+        } else {
+          for (const [name, fsm] of doc.fsms) {
+            const stateCount = fsm.states.length;
+            result.transcript.push(`  ${name} (${stateCount} state${stateCount !== 1 ? 's' : ''}, initial: ${fsm.initialState})`);
+          }
+        }
+      }
+      break;
+    }
+
+    case 'fsmList': {
+      if (doc.fsms.size === 0) {
+        result.transcript.push('No FSMs defined');
+      } else {
+        result.transcript.push('FSMs:');
+        for (const [name, fsm] of doc.fsms) {
+          const stateCount = fsm.states.length;
+          result.transcript.push(`  ${name} (${stateCount} state${stateCount !== 1 ? 's' : ''}, initial: ${fsm.initialState})`);
+        }
+      }
+      break;
+    }
+
+    case 'fsmDelete': {
+      if (!doc.fsms.has(cmd.name)) {
+        result.errors.push(`FSM "${cmd.name}" not found`);
+        break;
+      }
+      result.docCommands.push({ type: 'DeleteFSM', name: cmd.name });
+      result.transcript.push(`Deleted FSM "${cmd.name}"`);
+      break;
+    }
+
+    case 'routeAdd': {
+      result.docCommands.push({ type: 'AddRoute', name: cmd.name, pattern: cmd.pattern });
+      result.transcript.push(`Added route "${cmd.name}" → ${cmd.pattern}`);
+      break;
+    }
+
+    case 'routeRemove': {
+      result.docCommands.push({ type: 'RemoveRoute', name: cmd.name });
+      result.transcript.push(`Removed route "${cmd.name}"`);
+      break;
+    }
+
+    case 'screenSet': {
+      result.docCommands.push({ type: 'SetScreen', routeName: cmd.routeName, screenNodeName: cmd.nodeName });
+      result.transcript.push(`Screen for route "${cmd.routeName}" set to "${cmd.nodeName}"`);
+      break;
+    }
+
+    case 'routeGoto': {
+      result.editorCommands.push({ type: 'RouteGoto', path: cmd.path, mode: cmd.replace ? 'replace' : 'push' });
+      break;
+    }
+
+    case 'routeList': {
+      result.editorCommands.push({ type: 'RouteList' });
+      break;
+    }
+
+    case 'routeWhere': {
+      result.editorCommands.push({ type: 'RouteWhere' });
+      break;
+    }
+
+    case 'historyCompact':
+      result.editorCommands.push({ type: 'HistoryCompact', mode: cmd.mode });
+      break;
+
+    case 'macroDefine': {
+      let sourceId: NodeId | null = null;
+      if (cmd.from === 'selected') {
+        sourceId = ctx.selectedId;
+      } else {
+        sourceId = resolveTarget(cmd.from, doc, scopeId, ctx.selectedId);
+      }
+      if (!sourceId) {
+        result.errors.push(`Cannot resolve source "${cmd.from}" for macro define — select a node or provide a target`);
+        break;
+      }
+      const template = captureTemplate(doc, sourceId);
+      if (!template) {
+        result.errors.push(`Cannot capture template from node "${sourceId}"`);
+        break;
+      }
+      result.docCommands.push({ type: 'DefineMacro', name: cmd.name, template });
+      result.transcript.push(`Defined macro "${cmd.name}" from ${sourceId}`);
+      break;
+    }
+
+    case 'macroParams': {
+      const macro = doc.macros.get(cmd.name);
+      if (!macro) {
+        result.errors.push(`Macro "${cmd.name}" not found — define it first`);
+        break;
+      }
+      result.docCommands.push({ type: 'UpdateMacroParams', name: cmd.name, params: cmd.params });
+      result.transcript.push(`Set params for macro "${cmd.name}": ${cmd.params.join(', ')}`);
+      break;
+    }
+
+    case 'macroShow': {
+      const macro = doc.macros.get(cmd.name);
+      if (!macro) {
+        result.errors.push(`Macro "${cmd.name}" not found`);
+        break;
+      }
+      result.transcript.push(`Macro: ${macro.name}`);
+      result.transcript.push(`Params: ${macro.params.length > 0 ? macro.params.join(', ') : '(none)'}`);
+      result.transcript.push(`Template: ${macro.template.kind}${macro.template.layout ? ` (${macro.template.layout.type})` : ''}`);
+      if (macro.template.props && Object.keys(macro.template.props).length > 0) {
+        result.transcript.push(`Props: ${JSON.stringify(macro.template.props)}`);
+      }
+      if (macro.template.styleTokens.length > 0) {
+        result.transcript.push(`Style: ${macro.template.styleTokens.join(' ')}`);
+      }
+      if (macro.template.children && macro.template.children.length > 0) {
+        const childCount = macro.template.children.reduce((sum, g) => sum + g.nodes.length, 0);
+        result.transcript.push(`Children: ${childCount} node(s)`);
+      }
+      break;
+    }
+
+    case 'macroList': {
+      if (doc.macros.size === 0) {
+        result.transcript.push('No macros defined');
+      } else {
+        result.transcript.push('Macros:');
+        for (const [name, macro] of doc.macros) {
+          const paramStr = macro.params.length > 0 ? ` (params: ${macro.params.join(', ')})` : '';
+          result.transcript.push(`  ${name}${paramStr}`);
+        }
+      }
+      break;
+    }
+
+    case 'macroDelete': {
+      if (!doc.macros.has(cmd.name)) {
+        result.errors.push(`Macro "${cmd.name}" not found`);
+        break;
+      }
+      result.docCommands.push({ type: 'DeleteMacro', name: cmd.name });
+      result.transcript.push(`Deleted macro "${cmd.name}"`);
+      break;
+    }
+
+    case 'use': {
+      const macro = doc.macros.get(cmd.name);
+      if (!macro) {
+        result.errors.push(`Macro "${cmd.name}" not found — define it first`);
+        break;
+      }
+
+      // Build overrides from bindings
+      const overrides: Record<string, any> = {};
+      for (const b of cmd.bindings) {
+        if (macro.params.length > 0 && !macro.params.includes(b.key)) {
+          result.transcript.push(`Warning: "${b.key}" is not a declared param of macro "${cmd.name}" (declared: ${macro.params.join(', ')})`);
+        }
+        overrides[b.key] = b.value;
+      }
+
+      const parentNode = doc.nodes.get(targetScopeId);
+      const slot = targetSlot ?? (parentNode ? getDefaultSlot(parentNode) : 'content');
+
+      const expandedCmds = expandTemplate(
+        macro.template,
+        overrides,
+        (kind: string) => ctx.bus.allocId(kind),
+        targetScopeId,
+        slot,
+      );
+      result.docCommands.push(...expandedCmds);
+      result.transcript.push(`Instantiated macro "${cmd.name}" in ${targetScopeId}/${slot}`);
+      break;
+    }
+
     case 'error':
       result.errors.push(cmd.message);
       break;
@@ -290,7 +592,12 @@ function resolveCommandTarget(
     if (target.value === 'root') return doc.rootId;
   }
 
-  return resolveTarget(target.value.startsWith('#') ? target.value : target.value, doc, scopeId, selectedId);
+  if (target.kind === 'id') {
+    // Direct ID lookup — the parser already stripped the '#'
+    return doc.nodes.has(target.value) ? target.value : null;
+  }
+
+  return resolveTarget(target.value, doc, scopeId, selectedId);
 }
 
 function resolveSlotPath(
@@ -322,6 +629,20 @@ function resolveSlotPath(
       parentId = r;
     } else {
       parentId = resolved;
+    }
+  }
+
+  // If slot is specified but doesn't exist on the parent, try treating it
+  // as a node name and use that node's default slot instead.
+  if (sp.slot) {
+    const parentNode = doc.nodes.get(parentId);
+    const parentSlots = parentNode?.layout?.slots ?? ['content'];
+    if (!parentSlots.includes(sp.slot)) {
+      const nodeAsTarget = resolveTarget(sp.slot, doc, scopeId, selectedId);
+      if (nodeAsTarget) {
+        const targetNode = doc.nodes.get(nodeAsTarget);
+        return { parentId: nodeAsTarget, slot: targetNode ? getDefaultSlot(targetNode) : undefined };
+      }
     }
   }
 

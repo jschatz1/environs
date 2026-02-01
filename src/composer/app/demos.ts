@@ -2,10 +2,12 @@
 // Prebuilt demo definitions for the Composer
 // ---------------------------------------------------------------------------
 
+export type DemoStep = string | { scriptTarget: string; source: string };
+
 export interface Demo {
   name: string;
   description: string;
-  commands: string[];
+  commands: DemoStep[];
 }
 
 export const DEMOS: Record<string, Demo> = {
@@ -123,11 +125,11 @@ export const DEMOS: Record<string, Demo> = {
     name: 'Dashboard',
     description: 'Dark sidebar with nav, header with search, stat cards, and activity table',
     commands: [
-      // Shell — use stack with flex-col @md:flex-row instead of sidebar for responsive
-      'layout stack as shell style tw:"min-h-screen bg-slate-100 flex-col @md:flex-row"',
-      // Sidebar
-      'layout stack as nav style tw:"bg-slate-900 p-4 @md:p-6 @md:w-72 @md:h-auto @md:shrink-0" gap-lg',
-      'place nav in shell/content',
+      // Shell — sidebar layout for desktop; responsive overrides collapse nav on small screens
+      'layout sidebar as shell style tw:"min-h-screen bg-slate-100"',
+      // Sidebar nav
+      'layout stack as nav style tw:"bg-slate-900 p-4 @md:p-6" gap-lg',
+      'place nav in shell/left',
       // Logo
       'layout stack as logoRow axis=x style gap-sm tw:"items-center"',
       'place logoRow in nav/content',
@@ -149,14 +151,15 @@ export const DEMOS: Record<string, Demo> = {
       'add menuItem "Settings" as navSettings style tw:"flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:text-white hover:bg-white/5 whitespace-nowrap hidden @sm:flex"',
       'place navSettings in navMenu/content',
       // Main content
-      'layout stack as main style tw:"p-4 @md:p-8 overflow-y-auto flex-1" gap-lg',
-      'place main in shell/content',
+      'layout stack as main style tw:"p-4 @md:p-8 overflow-y-auto" gap-lg',
+      'place main in shell/main',
       // Header row
       'layout stack as header axis=x justify=between align=center style w-full tw:"flex-wrap gap-2"',
       'place header in main/content',
       'add text "Good morning, Sarah" as greeting style tw:"text-xl @md:text-2xl font-bold text-slate-900"',
       'place greeting in header/content',
-      'add input "Search..." as search style tw:"w-full @sm:w-64 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm shadow-sm"',
+      'add input as search style tw:"w-full @sm:w-64 rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm shadow-sm"',
+      'set search placeholder="Search..."',
       'place search in header/content',
       // Stat cards
       'layout grid as stats cols=1 style gap-md tw:"@sm:grid-cols-2 @lg:grid-cols-4"',
@@ -804,13 +807,207 @@ export const DEMOS: Record<string, Demo> = {
       'place t9Text in t9/content',
     ],
   },
+  '11': {
+    name: 'Interactive Tabs (FSM + Scripts)',
+    description: 'Tabbed panel driven by a finite state machine, with scripts controlling visibility and active styles',
+    commands: [
+      // Page wrapper
+      'layout stack as page align=center style tw:"min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 py-10 @md:py-20 px-4" gap-lg',
+      // Heading
+      'add text "Interactive Components" as heading style tw:"text-2xl @md:text-4xl font-extrabold text-slate-900 tracking-tight text-center"',
+      'place heading in page/content',
+      'add text "Tabs powered by FSM state machines with reactive scripts" as subtitle style tw:"text-base @md:text-lg text-slate-500 text-center max-w-lg"',
+      'place subtitle in page/content',
+      // Card wrapper
+      'layout stack as card style tw:"w-full max-w-2xl bg-white rounded-2xl border border-slate-200 shadow-lg overflow-hidden" gap-0',
+      'place card in page/content',
+      // Tab bar
+      'layout stack as tabBar axis=x style tw:"border-b border-slate-200 bg-slate-50" gap-0',
+      'place tabBar in card/content',
+      'add button "Overview" as tab1Btn style tw:"flex-1 px-4 py-3 text-sm font-semibold text-indigo-700 bg-white border-b-2 border-indigo-600 transition-all"',
+      'place tab1Btn in tabBar/content',
+      'add button "Features" as tab2Btn style tw:"flex-1 px-4 py-3 text-sm font-medium text-slate-500 hover:text-slate-700 border-b-2 border-transparent transition-all"',
+      'place tab2Btn in tabBar/content',
+      'add button "Pricing" as tab3Btn style tw:"flex-1 px-4 py-3 text-sm font-medium text-slate-500 hover:text-slate-700 border-b-2 border-transparent transition-all"',
+      'place tab3Btn in tabBar/content',
+      // Tab panels
+      'layout stack as panel1 style tw:"p-6 @md:p-8" gap-md',
+      'place panel1 in card/content',
+      'add container as overviewIcon style tw:"w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-lg shadow-indigo-500/25"',
+      'place overviewIcon in panel1/content',
+      'add text "Welcome to Environs" as p1Title style tw:"text-xl font-bold text-slate-900"',
+      'place p1Title in panel1/content',
+      'add text "Environs is a fine-grained reactive UI framework. This demo shows tabs driven by an FSM — click the tabs above to switch views. The active tab styling and panel visibility are all controlled by scripts reacting to FSM state changes." as p1Body style tw:"text-sm text-slate-600 leading-relaxed"',
+      'place p1Body in panel1/content',
+      'layout stack as panel2 style tw:"p-6 @md:p-8 hidden" gap-md',
+      'place panel2 in card/content',
+      'add container as featIcon style tw:"w-12 h-12 rounded-xl bg-gradient-to-br from-emerald-500 to-teal-500 shadow-lg shadow-emerald-500/25"',
+      'place featIcon in panel2/content',
+      'add text "Key Features" as p2Title style tw:"text-xl font-bold text-slate-900"',
+      'place p2Title in panel2/content',
+      'add text "Fine-grained reactivity — only the DOM nodes that depend on a signal update when it changes. Zero virtual DOM overhead." as p2f1 style tw:"text-sm text-slate-600 leading-relaxed"',
+      'place p2f1 in panel2/content',
+      'add text "Automatic cleanup via ownership trees. Effects, listeners, and subscriptions are disposed when their owner is removed." as p2f2 style tw:"text-sm text-slate-600 leading-relaxed"',
+      'place p2f2 in panel2/content',
+      'add text "Built-in FSM system for coordinating complex UI state transitions across multiple components." as p2f3 style tw:"text-sm text-slate-600 leading-relaxed"',
+      'place p2f3 in panel2/content',
+      'layout stack as panel3 style tw:"p-6 @md:p-8 hidden" gap-md',
+      'place panel3 in card/content',
+      'add container as priceIcon style tw:"w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-orange-500 shadow-lg shadow-amber-500/25"',
+      'place priceIcon in panel3/content',
+      'add text "Simple Pricing" as p3Title style tw:"text-xl font-bold text-slate-900"',
+      'place p3Title in panel3/content',
+      'add text "Free and open source. Use it in personal projects, startups, or enterprise applications — no license fees, no strings attached." as p3Body style tw:"text-sm text-slate-600 leading-relaxed"',
+      'place p3Body in panel3/content',
+      'add button "Get Started Free" as p3Btn style tw:"bg-amber-500 text-white hover:bg-amber-600 px-6 py-3 rounded-xl text-sm font-bold shadow-lg shadow-amber-500/25 transition-all w-fit"',
+      'place p3Btn in panel3/content',
+      // Define the FSM
+      'fsm define tabs initial tab1',
+      'fsm state tabs tab1 on TAB2 tab2 on TAB3 tab3',
+      'fsm state tabs tab2 on TAB1 tab1 on TAB3 tab3',
+      'fsm state tabs tab3 on TAB1 tab1 on TAB2 tab2',
+      // Scripts — tab buttons: click handler + active styling in one script
+      { scriptTarget: 'tab1Btn', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'self.onClick(() => tabs.send("TAB1"))',
+        'ctx.effect(() => {',
+        '  const active = tabs.current() === "tab1"',
+        '  self.el.className = active',
+        '    ? "flex-1 px-4 py-3 text-sm font-semibold text-indigo-700 bg-white border-b-2 border-indigo-600 transition-all"',
+        '    : "flex-1 px-4 py-3 text-sm font-medium text-slate-500 hover:text-slate-700 border-b-2 border-transparent transition-all"',
+        '})',
+      ].join('\n') },
+      { scriptTarget: 'tab2Btn', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'self.onClick(() => tabs.send("TAB2"))',
+        'ctx.effect(() => {',
+        '  const active = tabs.current() === "tab2"',
+        '  self.el.className = active',
+        '    ? "flex-1 px-4 py-3 text-sm font-semibold text-indigo-700 bg-white border-b-2 border-indigo-600 transition-all"',
+        '    : "flex-1 px-4 py-3 text-sm font-medium text-slate-500 hover:text-slate-700 border-b-2 border-transparent transition-all"',
+        '})',
+      ].join('\n') },
+      { scriptTarget: 'tab3Btn', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'self.onClick(() => tabs.send("TAB3"))',
+        'ctx.effect(() => {',
+        '  const active = tabs.current() === "tab3"',
+        '  self.el.className = active',
+        '    ? "flex-1 px-4 py-3 text-sm font-semibold text-indigo-700 bg-white border-b-2 border-indigo-600 transition-all"',
+        '    : "flex-1 px-4 py-3 text-sm font-medium text-slate-500 hover:text-slate-700 border-b-2 border-transparent transition-all"',
+        '})',
+      ].join('\n') },
+      // Scripts — panels show/hide based on FSM state
+      // Use classList to toggle 'hidden' so it works with the initial Tailwind class
+      { scriptTarget: 'panel1', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'ctx.effect(() => {',
+        '  const show = tabs.current() === "tab1"',
+        '  self.el.classList.toggle("hidden", !show)',
+        '})',
+      ].join('\n') },
+      { scriptTarget: 'panel2', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'ctx.effect(() => {',
+        '  const show = tabs.current() === "tab2"',
+        '  self.el.classList.toggle("hidden", !show)',
+        '})',
+      ].join('\n') },
+      { scriptTarget: 'panel3', source: [
+        'const tabs = ctx.global.fsm("tabs")',
+        'ctx.effect(() => {',
+        '  const show = tabs.current() === "tab3"',
+        '  self.el.classList.toggle("hidden", !show)',
+        '})',
+      ].join('\n') },
+    ],
+  },
+  '12': {
+    name: 'Router + Screens',
+    description: 'Sidebar app with two screens, URL-driven navigation via router, and reactive browser bar',
+    commands: [
+      // Shell — sidebar layout
+      'layout sidebar as shell style tw:"min-h-screen bg-slate-100"',
+      // Sidebar nav
+      'layout stack as nav style tw:"bg-slate-900 p-4 @md:p-6" gap-lg',
+      'place nav in shell/left',
+      // Logo
+      'layout stack as logoRow axis=x style gap-sm tw:"items-center"',
+      'place logoRow in nav/content',
+      'add container as logoIcon style tw:"w-8 h-8 bg-gradient-to-br from-violet-500 to-indigo-600 rounded-lg"',
+      'place logoIcon in logoRow/content',
+      'add text "AppName" as logo style tw:"text-xl font-bold text-white"',
+      'place logo in logoRow/content',
+      // Nav menu
+      'add menu as navMenu style tw:"flex flex-col gap-1 mt-4"',
+      'place navMenu in nav/content',
+      'add menuItem "Home" as navHome style tw:"flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium bg-white/10 text-white"',
+      'place navHome in navMenu/content',
+      'add menuItem "Settings" as navSettings style tw:"flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:text-white hover:bg-white/5"',
+      'place navSettings in navMenu/content',
+      // Main content area with outlet
+      'add outlet as main style tw:"p-0"',
+      'place main in shell/main',
+      // Create screens inside outlet
+      'enter main',
+      // Home screen
+      'layout stack as homeScreen style gap-md tw:"p-8"',
+      'add container as homeIcon style tw:"w-12 h-12 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-500 shadow-lg shadow-indigo-500/25"',
+      'place homeIcon in homeScreen/content',
+      'add text "Welcome Home" as homeTitle style tw:"text-2xl font-bold text-slate-900"',
+      'place homeTitle in homeScreen/content',
+      'add text "This is the home screen. Click Settings in the sidebar to navigate, or use the browser back/forward buttons." as homeDesc style tw:"text-sm text-slate-600 leading-relaxed max-w-lg"',
+      'place homeDesc in homeScreen/content',
+      // Settings screen
+      'layout stack as settingsScreen style gap-md tw:"p-8"',
+      'add container as settingsIcon style tw:"w-12 h-12 rounded-xl bg-gradient-to-br from-amber-500 to-orange-500 shadow-lg shadow-amber-500/25"',
+      'place settingsIcon in settingsScreen/content',
+      'add text "Settings" as settingsTitle style tw:"text-2xl font-bold text-slate-900"',
+      'place settingsTitle in settingsScreen/content',
+      'add text "Configure your application preferences here. This screen is shown when navigating to /settings." as settingsDesc style tw:"text-sm text-slate-600 leading-relaxed max-w-lg"',
+      'place settingsDesc in settingsScreen/content',
+      'add button "Back to Home" as backBtn style tw:"bg-indigo-600 text-white hover:bg-indigo-700 px-5 py-2.5 rounded-lg text-sm font-semibold shadow-sm transition-all w-fit"',
+      'place backBtn in settingsScreen/content',
+      'exit',
+      // Define routes and map to screens
+      'route add home "/"',
+      'route add settings "/settings"',
+      'screen set home homeScreen',
+      'screen set settings settingsScreen',
+      // Scripts on nav buttons for navigation + active highlighting
+      { scriptTarget: 'navHome', source: [
+        'const router = ctx.global.router',
+        'self.onClick(() => router.push("/"))',
+        'ctx.effect(() => {',
+        '  const active = router.routeName() === "home"',
+        '  self.el.className = active',
+        '    ? "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium bg-white/10 text-white"',
+        '    : "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:text-white hover:bg-white/5"',
+        '})',
+      ].join('\n') },
+      { scriptTarget: 'navSettings', source: [
+        'const router = ctx.global.router',
+        'self.onClick(() => router.push("/settings"))',
+        'ctx.effect(() => {',
+        '  const active = router.routeName() === "settings"',
+        '  self.el.className = active',
+        '    ? "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium bg-white/10 text-white"',
+        '    : "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm text-slate-400 hover:text-white hover:bg-white/5"',
+        '})',
+      ].join('\n') },
+      // Back button navigates to home
+      { scriptTarget: 'backBtn', source: [
+        'self.onClick(() => ctx.global.router.push("/"))',
+      ].join('\n') },
+    ],
+  },
 };
 
 // ---------------------------------------------------------------------------
 // Lookup helper
 // ---------------------------------------------------------------------------
 
-export function getDemoCommands(id: string): string[] | null {
+export function getDemoCommands(id: string): DemoStep[] | null {
   const demo = DEMOS[id];
   return demo ? demo.commands : null;
 }

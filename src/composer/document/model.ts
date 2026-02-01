@@ -14,9 +14,41 @@ export type NodeKind =
   | 'menuItem'
   | 'container'
   | 'image'
-  | 'divider';
+  | 'divider'
+  | 'link'
+  | 'outlet';
 
-export type LayoutType = 'stack' | 'grid' | 'sidebar' | 'center' | 'tabs' | 'split';
+export type LayoutType = 'stack' | 'grid' | 'sidebar' | 'center' | 'tabs' | 'split' | 'paragraph' | 'repeat';
+
+// ---------------------------------------------------------------------------
+// Script attachment
+// ---------------------------------------------------------------------------
+
+export interface ScriptAttachment {
+  language: 'js';
+  source: string;
+  version: number;
+}
+
+// ---------------------------------------------------------------------------
+// FSM definitions
+// ---------------------------------------------------------------------------
+
+export interface FSMTransition {
+  target: string;
+  action?: string;
+}
+
+export interface FSMStateDef {
+  name: string;
+  on?: Record<string, string | FSMTransition>;
+}
+
+export interface FSMDef {
+  name: string;
+  initialState: string;
+  states: FSMStateDef[];
+}
 
 // ---------------------------------------------------------------------------
 // Node record
@@ -38,6 +70,7 @@ export interface NodeRecord {
   props: Record<string, any>;
   styleTokens: string[];
   events?: Record<string, any>;
+  script?: ScriptAttachment;
 }
 
 // ---------------------------------------------------------------------------
@@ -52,6 +85,41 @@ export interface Edge {
 }
 
 // ---------------------------------------------------------------------------
+// Route definitions
+// ---------------------------------------------------------------------------
+
+export interface RouteDef {
+  name: string;           // "home", "settings"
+  pattern: string;        // "/", "/post/:id"
+  screenNodeName: string; // name of node to show
+  order: number;          // match precedence
+}
+
+export interface RoutingConfig {
+  routes: RouteDef[];
+}
+
+// ---------------------------------------------------------------------------
+// Macro definitions
+// ---------------------------------------------------------------------------
+
+export interface TemplateNode {
+  kind: NodeKind;
+  tag?: string;
+  name?: string;
+  props: Record<string, any>;
+  styleTokens: string[];
+  layout?: { type: LayoutType; options: Record<string, any> };
+  children?: { slot: string; nodes: TemplateNode[] }[];
+}
+
+export interface MacroDef {
+  name: string;
+  params: string[];
+  template: TemplateNode;
+}
+
+// ---------------------------------------------------------------------------
 // Document model
 // ---------------------------------------------------------------------------
 
@@ -59,6 +127,9 @@ export interface DocumentModel {
   nodes: Map<NodeId, NodeRecord>;
   edges: Edge[];
   rootId: NodeId;
+  fsms: Map<string, FSMDef>;
+  routing: RoutingConfig;
+  macros: Map<string, MacroDef>;
 }
 
 export function createDocument(): DocumentModel {
@@ -80,7 +151,7 @@ export function createDocument(): DocumentModel {
   const nodes = new Map<NodeId, NodeRecord>();
   nodes.set(rootId, rootNode);
 
-  return { nodes, edges: [], rootId };
+  return { nodes, edges: [], rootId, fsms: new Map(), routing: { routes: [] }, macros: new Map() };
 }
 
 // ---------------------------------------------------------------------------

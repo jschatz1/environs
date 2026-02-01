@@ -8,6 +8,7 @@ export type PatchOp =
   | { op: 'create'; node: IRNode }
   | { op: 'remove'; id: string }
   | { op: 'updateText'; id: string; text: string | undefined }
+  | { op: 'updateRichText'; id: string; html: string | undefined }
   | { op: 'updateClasses'; id: string; classes: string }
   | { op: 'updateAttrs'; id: string; attrs: Record<string, string> }
   | { op: 'place'; parentId: string; childId: string; order: number }
@@ -42,6 +43,9 @@ export function diffIR(prev: IR | null, next: IR): PatchOp[] {
 
     if (prev.text !== node.text) {
       ops.push({ op: 'updateText', id, text: node.text });
+    }
+    if (prev.richText !== node.richText) {
+      ops.push({ op: 'updateRichText', id, html: node.richText });
     }
     if (prev.classes !== node.classes) {
       ops.push({ op: 'updateClasses', id, classes: node.classes });

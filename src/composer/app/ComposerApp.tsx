@@ -11,14 +11,20 @@ import {
 } from '../../index.js';
 import { createCommandBus } from '../commands/bus.js';
 import { createEditorState, type TranscriptEntry } from './EditorState.js';
-import { parseExplicit } from '../commands/parseExplicit.js';
+import { parseExplicit, type ParsedLine } from '../commands/parseExplicit.js';
 import { parseNatural } from '../commands/parseNatural.js';
+import { expandRepeat } from '../commands/expandRepeat.js';
 import { executeStatement } from '../commands/toCommands.js';
 import { compileToIR, type IR } from '../compiler/compileToIR.js';
 import { diffIR } from '../compiler/diffIR.js';
 import { createDOMBackend, type DOMBackend } from '../backend/domBackend.js';
 import { getSuggestions } from './suggestions.js';
-import { DEMOS, getDemoCommands } from './demos.js';
+import { highlightCommand } from './highlight.js';
+import { DEMOS, getDemoCommands, type DemoStep } from './demos.js';
+import { runScriptsForDocument, disposeAllScripts } from '../script/runtime.js';
+import { syncFSMs, resetAllFSMs } from '../fsm/registry.js';
+import { getRouter, resetRouter } from '../router/runtime.js';
+import type { NodeId } from '../document/ids.js';
 
 // ---------------------------------------------------------------------------
 // Main Composer Application
@@ -35,21 +41,36 @@ function ComposerApp() {
 
   // Input state
   const inputValue = signal('');
-  const inputRef = signal<HTMLInputElement | null>(null);
+  const inputRef = signal<HTMLInputElement | HTMLTextAreaElement | null>(null);
+
+  // Command history for up/down arrow recall
+  const commandHistory: string[] = [];
+  let historyIndex = -1; // -1 means not browsing history
+  let savedInput = ''; // saves current input when entering history
 
   // Viewport state
   type Viewport = 'desktop' | 'landscape' | 'portrait';
   const viewport = signal<Viewport>('desktop');
 
+  // Script capture mode
+  const scriptCapture = signal<{ targetId: NodeId } | null>(null);
+
+  // Multi-line input mode (triggered by pasting text with newlines)
+  const multiLine = signal(false);
+
   // Autocomplete state
   const selectedSuggestionIndex = signal(-1);
   const suggestions = computed(() => getSuggestions(inputValue(), bus.doc()));
+
+  // Reactivity bridge: bumped after scripts run so repeat nodes re-read signals
+  const repeatVersion = signal(0);
 
   // ---------------------------------------------------------------------------
   // Compilation pipeline: doc changes → IR → DOM patches
   // ---------------------------------------------------------------------------
   effect(() => {
     const doc = bus.doc();
+    repeatVersion(); // subscribe so we recompile when scripts create repeat-items signals
     if (!backend || !stageEl) return;
 
     const ir = compileToIR(doc);
@@ -65,10 +86,202 @@ function ComposerApp() {
   });
 
   // ---------------------------------------------------------------------------
+  // Script execution: run after DOM patches
+  // ---------------------------------------------------------------------------
+  effect(() => {
+    const doc = bus.doc();
+    if (!backend) return;
+    // Sync FSM registry before running scripts so ctx.global.fsm() works
+    syncFSMs(doc);
+    const errors = runScriptsForDocument(doc, backend);
+    if (errors.length > 0) {
+      const entry: TranscriptEntry = {
+        input: '',
+        explicit: [],
+        status: 'err',
+        errors: errors.map(e => `Script error on ${e.nodeId} (${e.phase}): ${e.message}`),
+        messages: [],
+      };
+      editor.transcript.update(t => [...t, entry]);
+    }
+
+    // Bump repeatVersion so the compilation effect re-runs and picks up
+    // any signals that scripts just created (e.g. window.__app.todos)
+    const hasRepeat = Array.from(doc.nodes.values()).some(n => n.layout?.type === 'repeat');
+    if (hasRepeat) {
+      repeatVersion.set(repeatVersion() + 1);
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Router: sync route definitions when doc changes
+  // ---------------------------------------------------------------------------
+  // Ensure a router instance exists at startup
+  getRouter();
+
+  effect(() => {
+    const doc = bus.doc();
+    getRouter().syncRoutes(doc.routing.routes);
+  });
+
+  // ---------------------------------------------------------------------------
+  // Router: toggle screen visibility when location changes
+  // ---------------------------------------------------------------------------
+  effect(() => {
+    const doc = bus.doc();
+    const loc = getRouter().location();
+
+    for (const route of doc.routing.routes) {
+      if (!route.screenNodeName) continue;
+      for (const [id, node] of doc.nodes) {
+        if (node.name === route.screenNodeName && backend) {
+          const el = backend.getElement(id);
+          if (el) el.classList.toggle('hidden', route.name !== loc.routeName);
+        }
+      }
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Run a single command string through parse → execute → transcript
+  // ---------------------------------------------------------------------------
+  function runCommand(raw: string): void {
+    const entry: TranscriptEntry = {
+      input: raw,
+      explicit: [],
+      status: 'ok',
+      errors: [],
+      messages: [],
+    };
+
+    const expanded = expandRepeat(raw);
+
+    const parsed = parseExplicit(expanded);
+
+    // Per-line NL fallback: only re-parse lines that have errors, not the
+    // entire input.  Sending a large multi-line script (especially after
+    // repeat expansion) through parseNatural produces garbage.
+    const lines = parsed.lines.flatMap(line => {
+      const hasLineError = line.statements.some(s => s.command.type === 'error');
+      if (!hasLineError) return [line];
+
+      // Split: keep valid statements, NL-fallback only the error ones
+      const validStmts = line.statements.filter(s => s.command.type !== 'error');
+      const errorStmts = line.statements.filter(s => s.command.type === 'error');
+
+      const lineText = errorStmts
+        .map(s => (s.command as { input: string }).input)
+        .join(' ');
+
+      const result: ParsedLine[] = [];
+      if (validStmts.length > 0) {
+        result.push({ statements: validStmts });
+      }
+
+      if (lineText) {
+        const nl = parseNatural(lineText);
+        if (nl.explicit.length > 0) {
+          entry.explicit.push(...nl.explicit);
+          const combined = nl.explicit.join('; ');
+          const reparsed = parseExplicit(combined);
+          result.push(...reparsed.lines);
+        } else {
+          // NL parser couldn't help — keep error statements for error reporting
+          result.push({ statements: errorStmts });
+        }
+      }
+
+      return result.length > 0 ? result : [line];
+    });
+
+    if (entry.explicit.length === 0) {
+      entry.explicit = [raw];
+    }
+
+    for (const line of lines) {
+      for (const stmt of line.statements) {
+        const result = executeStatement(stmt, {
+          bus,
+          scopeStack: editor.scopeStack(),
+          selectedId: editor.selectedId(),
+        });
+
+        if (result.docCommands.length > 0) {
+          bus.dispatch(result.docCommands);
+        }
+
+        for (const ecmd of result.editorCommands) {
+          const msgs = editor.applyEditorCommand(ecmd, bus);
+          entry.messages.push(...msgs);
+        }
+
+        entry.messages.push(...result.transcript);
+        entry.errors.push(...result.errors);
+
+        if (result.scriptCaptureTarget) {
+          scriptCapture.set({ targetId: result.scriptCaptureTarget });
+          const existingNode = bus.doc().nodes.get(result.scriptCaptureTarget);
+          if (existingNode?.script) {
+            inputValue.set(existingNode.script.source);
+          }
+        }
+      }
+    }
+
+    if (entry.errors.length > 0) entry.status = 'err';
+    editor.transcript.update(t => [...t, entry]);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Listen for import replay events
+  // ---------------------------------------------------------------------------
+  document.addEventListener('environs:import', ((e: CustomEvent<{ lines: string[]; fileName?: string }>) => {
+    // Reset DOM backend for clean slate
+    if (stageEl) {
+      while (stageEl.firstChild) stageEl.removeChild(stageEl.firstChild);
+      backend = createDOMBackend(stageEl);
+      prevIR = null;
+    }
+    for (const line of e.detail.lines) {
+      runCommand(line);
+    }
+  }) as EventListener);
+
+  // ---------------------------------------------------------------------------
   // Handle input submission
   // ---------------------------------------------------------------------------
   function handleSubmit(e?: Event) {
     e?.preventDefault();
+
+    // Script capture mode: read directly from the textarea element,
+    // not from inputValue (the textarea has no onInput handler).
+    const capture = scriptCapture();
+    if (capture) {
+      const el = inputRef();
+      const source = (el ? el.value : inputValue()).trim();
+      if (!source) return;
+      const lineCount = source.split('\n').length;
+      bus.dispatch([{
+        type: 'ScriptSet',
+        id: capture.targetId,
+        language: 'js',
+        source,
+      }]);
+      const node = bus.doc().nodes.get(capture.targetId);
+      const entry: TranscriptEntry = {
+        input: source.split('\n').map(l => `  ${l}`).join('\n'),
+        explicit: [],
+        status: 'ok',
+        errors: [],
+        messages: [`Script set on ${node?.name ?? capture.targetId} (${lineCount} line${lineCount !== 1 ? 's' : ''})`],
+      };
+      editor.transcript.update(t => [...t, entry]);
+      scriptCapture.set(null);
+      inputValue.set('');
+      if (el) el.value = '';
+      return;
+    }
+
     const raw = inputValue().trim();
     if (!raw) return;
 
@@ -114,6 +327,10 @@ function ComposerApp() {
       }
 
       // Reset document to blank slate before running demo
+      disposeAllScripts();
+      resetAllFSMs();
+      resetRouter();
+      scriptCapture.set(null);
       bus.importLog('[]');
       editor.transcript.set([]);
       editor.scopeStack.set([]);
@@ -126,7 +343,7 @@ function ComposerApp() {
         prevIR = null;
       }
 
-      // Feed demo commands through the existing pipeline, one entry per command
+      // Feed demo commands one at a time with a delay so you see it build out
       const headerEntry: TranscriptEntry = {
         input: raw,
         explicit: [],
@@ -134,12 +351,47 @@ function ComposerApp() {
         errors: [],
         messages: [`Running demo ${demoId}: ${DEMOS[demoId].name}`],
       };
-      const entries: TranscriptEntry[] = [headerEntry];
+      editor.transcript.update(t => [...t, headerEntry]);
 
-      for (const cmd of commands) {
-        const parsed = parseExplicit(cmd);
+      const STEP_DELAY = 60; // ms between commands
+
+      function runDemoStep(index: number) {
+        if (index >= commands.length) return;
+        const step = commands[index];
+
+        // Script attachment step — dispatch ScriptSet directly
+        if (typeof step !== 'string') {
+          const doc = bus.doc();
+          let targetId: NodeId | undefined;
+          for (const [id, node] of doc.nodes) {
+            if (node.name === step.scriptTarget) { targetId = id; break; }
+          }
+          if (targetId) {
+            bus.dispatch([{
+              type: 'ScriptSet',
+              id: targetId,
+              language: 'js',
+              source: step.source,
+            }]);
+            const lineCount = step.source.split('\n').length;
+            const entry: TranscriptEntry = {
+              input: `script set ${step.scriptTarget}`,
+              explicit: [],
+              status: 'ok',
+              errors: [],
+              messages: [`Script set on ${step.scriptTarget} (${lineCount} line${lineCount !== 1 ? 's' : ''})`],
+            };
+            editor.transcript.update(t => [...t, entry]);
+          }
+          if (index < commands.length - 1) {
+            setTimeout(() => runDemoStep(index + 1), STEP_DELAY);
+          }
+          return;
+        }
+
+        const parsed = parseExplicit(step);
         const entry: TranscriptEntry = {
-          input: cmd,
+          input: step,
           explicit: [],
           status: 'ok',
           errors: [],
@@ -166,76 +418,33 @@ function ComposerApp() {
         }
 
         if (entry.errors.length > 0) entry.status = 'err';
-        entries.push(entry);
+        editor.transcript.update(t => [...t, entry]);
+
+        if (index < commands.length - 1) {
+          setTimeout(() => runDemoStep(index + 1), STEP_DELAY);
+        }
       }
 
-      editor.transcript.update(t => [...t, ...entries]);
+      runDemoStep(0);
       inputValue.set('');
       const el = inputRef();
       if (el) el.value = '';
       return;
     }
 
-    const entry: TranscriptEntry = {
-      input: raw,
-      explicit: [],
-      status: 'ok',
-      errors: [],
-      messages: [],
-    };
+    commandHistory.push(raw);
+    historyIndex = -1;
+    savedInput = '';
 
-    // Try explicit parse first
-    const parsed = parseExplicit(raw);
-    const hasError = parsed.lines.some(l =>
-      l.statements.some(s => s.command.type === 'error')
-    );
-
-    let lines = parsed.lines;
-
-    // If explicit parse fails, try NL mapping
-    if (hasError) {
-      const nl = parseNatural(raw);
-      if (nl.explicit.length > 0) {
-        entry.explicit = nl.explicit;
-        const combined = nl.explicit.join('; ');
-        const reparsed = parseExplicit(combined);
-        lines = reparsed.lines;
-      }
-    } else {
-      entry.explicit = [raw];
-    }
-
-    // Execute all statements
-    for (const line of lines) {
-      for (const stmt of line.statements) {
-        const result = executeStatement(stmt, {
-          bus,
-          scopeStack: editor.scopeStack(),
-          selectedId: editor.selectedId(),
-        });
-
-        // Apply doc commands
-        if (result.docCommands.length > 0) {
-          bus.dispatch(result.docCommands);
-        }
-
-        // Apply editor commands
-        for (const ecmd of result.editorCommands) {
-          const msgs = editor.applyEditorCommand(ecmd, bus);
-          entry.messages.push(...msgs);
-        }
-
-        entry.messages.push(...result.transcript);
-        entry.errors.push(...result.errors);
-      }
-    }
-
-    if (entry.errors.length > 0) entry.status = 'err';
-
-    editor.transcript.update(t => [...t, entry]);
+    // Clear input state BEFORE runCommand — runCommand may set scriptCapture,
+    // which triggers the script capture textarea to mount. If inputValue isn't
+    // cleared first, the textarea reads the stale command text.
     inputValue.set('');
+    multiLine.set(false);
     const el = inputRef();
     if (el) el.value = '';
+
+    runCommand(raw);
   }
 
   // ---------------------------------------------------------------------------
@@ -262,7 +471,58 @@ function ComposerApp() {
     }
   }
 
+  function handlePaste(e: ClipboardEvent) {
+    const text = e.clipboardData?.getData('text') ?? '';
+    if (text.includes('\n')) {
+      e.preventDefault();
+      const current = inputValue();
+      const el = inputRef() as HTMLInputElement | HTMLTextAreaElement | null;
+      // Insert pasted text at cursor position
+      const start = el?.selectionStart ?? current.length;
+      const end = el?.selectionEnd ?? current.length;
+      const newVal = current.slice(0, start) + text + current.slice(end);
+      inputValue.set(newVal);
+      multiLine.set(true);
+      // Focus and set cursor will happen after the textarea renders
+      requestAnimationFrame(() => {
+        const ta = inputRef();
+        if (ta) {
+          ta.value = newVal;
+          ta.focus();
+          const cursorPos = start + text.length;
+          ta.selectionStart = ta.selectionEnd = cursorPos;
+        }
+      });
+    }
+  }
+
   function handleInputKeyDown(e: KeyboardEvent) {
+    // In multi-line mode: Enter inserts newline, Cmd/Ctrl+Enter submits
+    if (multiLine()) {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        handleSubmit();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        multiLine.set(false);
+        // Keep value, just switch back to single-line if no newlines remain
+        const val = inputValue();
+        if (!val.includes('\n')) {
+          requestAnimationFrame(() => {
+            const el = inputRef();
+            if (el) { el.value = val; el.focus(); }
+          });
+        } else {
+          multiLine.set(true); // stay in multi-line
+        }
+        return;
+      }
+      // Let all other keys (including Enter for newline) pass through
+      return;
+    }
+
     const suggs = suggestions();
     const idx = selectedSuggestionIndex();
 
@@ -304,6 +564,38 @@ function ComposerApp() {
       if (e.key === 'Enter') {
         e.preventDefault();
         handleSubmit();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        if (commandHistory.length === 0) return;
+        e.preventDefault();
+        if (historyIndex === -1) {
+          savedInput = inputValue();
+          historyIndex = commandHistory.length - 1;
+        } else if (historyIndex > 0) {
+          historyIndex--;
+        }
+        const val = commandHistory[historyIndex];
+        inputValue.set(val);
+        const el = inputRef();
+        if (el) el.value = val;
+        return;
+      }
+      if (e.key === 'ArrowDown') {
+        if (historyIndex === -1) return;
+        e.preventDefault();
+        if (historyIndex < commandHistory.length - 1) {
+          historyIndex++;
+          const val = commandHistory[historyIndex];
+          inputValue.set(val);
+          const el = inputRef();
+          if (el) el.value = val;
+        } else {
+          historyIndex = -1;
+          inputValue.set(savedInput);
+          const el = inputRef();
+          if (el) el.value = savedInput;
+        }
         return;
       }
     }
@@ -461,7 +753,10 @@ function ComposerApp() {
                     ? 'rounded-lg border border-red-100 bg-red-50 p-2 text-xs'
                     : 'rounded-lg border border-slate-100 bg-slate-50 p-2 text-xs'
                 }>
-                  <div class="font-mono text-slate-700 mb-1">{() => `> ${entry.input}`}</div>
+                  <div
+                    class="font-mono text-slate-700 mb-1 whitespace-pre-wrap"
+                    ref={(el: HTMLElement) => { el.innerHTML = '&gt; ' + highlightCommand(entry.input); }}
+                  />
                   <Show when={() => entry.explicit.length > 0 && entry.explicit[0] !== entry.input}>
                     {() => (
                       <div class="text-slate-400 mb-1">
@@ -472,7 +767,7 @@ function ComposerApp() {
                     )}
                   </Show>
                   <For each={() => entry.messages}>
-                    {(msg) => <div class="text-slate-600">{msg}</div>}
+                    {(msg) => <div class="text-slate-600 whitespace-pre-wrap">{msg}</div>}
                   </For>
                   <For each={() => entry.errors}>
                     {(err) => <div class="text-red-600">{err}</div>}
@@ -485,6 +780,38 @@ function ComposerApp() {
 
         {/* Stage */}
         <div class="flex-1 flex flex-col overflow-hidden">
+          {/* Browser chrome */}
+          <div class="shrink-0 bg-slate-200 border-b border-slate-300 px-3 py-2 flex items-center gap-3">
+            <div class="flex items-center gap-1.5">
+              <div class="w-3 h-3 rounded-full bg-[#FF5F57]" />
+              <div class="w-3 h-3 rounded-full bg-[#FEBC2E]" />
+              <div class="w-3 h-3 rounded-full bg-[#28C840]" />
+            </div>
+            <div class="flex items-center gap-2">
+              <div class="flex items-center gap-1">
+                <button
+                  class={() => getRouter().canGoBack()
+                    ? 'text-slate-500 hover:text-slate-700 cursor-pointer'
+                    : 'text-slate-300 cursor-default'}
+                  onClick={() => getRouter().back()}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                </button>
+                <button
+                  class={() => getRouter().canGoForward()
+                    ? 'text-slate-500 hover:text-slate-700 cursor-pointer'
+                    : 'text-slate-300 cursor-default'}
+                  onClick={() => getRouter().forward()}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+                </button>
+              </div>
+            </div>
+            <div class="flex-1 flex items-center bg-white rounded-lg border border-slate-300 px-3 py-1 text-xs text-slate-500 font-mono">
+              <svg class="shrink-0 mr-1.5 text-slate-400" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              <span>{() => `localhost:5173${getRouter().location().pathname}`}</span>
+            </div>
+          </div>
           <div class={() =>
             viewport() === 'desktop'
               ? 'flex-1 overflow-auto relative'
@@ -540,54 +867,159 @@ function ComposerApp() {
 
           {/* Input bar */}
           <div class="border-t border-slate-200 bg-white p-3">
-            <form
-              class="flex gap-2"
-              onSubmit={(e: Event) => handleSubmit(e)}
-            >
-              <div class="flex-1 relative">
-                {/* Suggestions dropdown */}
-                <Show when={() => suggestions().length > 0}>
-                  {() => (
-                    <div class="absolute bottom-full left-0 right-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg overflow-hidden z-50 max-h-60 overflow-y-auto">
-                      <For each={suggestions}>
-                        {(suggestion, index) => (
-                          <div
-                            class={() =>
-                              index() === selectedSuggestionIndex()
-                                ? 'px-3 py-1.5 text-sm font-mono cursor-pointer bg-blue-50 text-blue-700'
-                                : 'px-3 py-1.5 text-sm font-mono cursor-pointer hover:bg-slate-50 text-slate-700'
-                            }
-                            onMouseDown={(e: MouseEvent) => {
-                              e.preventDefault();
-                              acceptSuggestion(suggestion);
-                            }}
-                          >
-                            {suggestion}
-                          </div>
-                        )}
-                      </For>
+            <Show when={() => scriptCapture() !== null}>
+              {() => {
+                const cap = scriptCapture()!;
+                const targetNode = bus.doc().nodes.get(cap.targetId);
+                const label = targetNode?.name ?? cap.targetId;
+                return (
+                  <div class="flex flex-col gap-2">
+                    <div class="flex items-center gap-2 text-xs">
+                      <span class="px-2 py-0.5 rounded bg-amber-100 text-amber-700 font-semibold">Script mode</span>
+                      <span class="text-slate-500">Writing JS for <span class="font-medium text-slate-700">{label}</span></span>
+                      <button
+                        class="ml-auto text-slate-400 hover:text-slate-600 text-xs"
+                        onClick={() => { scriptCapture.set(null); inputValue.set(''); }}
+                      >
+                        Cancel
+                      </button>
                     </div>
-                  )}
-                </Show>
-                <input
-                  ref={(el: HTMLInputElement) => inputRef.set(el)}
-                  class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition placeholder:text-slate-400"
-                  placeholder="Type a command or describe what you want..."
-                  value={inputValue}
-                  onInput={(e: InputEvent) => {
-                    inputValue.set((e.target as HTMLInputElement).value);
-                    selectedSuggestionIndex.set(-1);
-                  }}
-                  onKeyDown={(e: KeyboardEvent) => handleInputKeyDown(e)}
-                />
-              </div>
-              <button
-                type="submit"
-                class="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 active:bg-blue-800 transition shrink-0"
-              >
-                Run
-              </button>
-            </form>
+                    <div class="flex gap-2">
+                      <textarea
+                        ref={(el: HTMLTextAreaElement) => {
+                          inputRef.set(el);
+                          const existing = inputValue();
+                          if (existing) el.value = existing;
+                          inputValue.set('');
+                          el.focus();
+                          el.selectionStart = el.selectionEnd = el.value.length;
+                        }}
+                        class="w-full px-3 py-2 rounded-lg border border-amber-300 bg-amber-50/30 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-400 focus:border-amber-400 transition placeholder:text-slate-400 resize-y min-h-[80px]"
+                        rows={5}
+                        placeholder="Type JS code here... (Cmd+Enter to save)"
+                        onKeyDown={(e: KeyboardEvent) => {
+                          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                            e.preventDefault();
+                            handleSubmit();
+                          }
+                          if (e.key === 'Escape') {
+                            e.preventDefault();
+                            scriptCapture.set(null);
+                          }
+                        }}
+                      />
+                      <button
+                        class="px-4 py-2 rounded-lg bg-amber-500 text-white text-sm font-medium hover:bg-amber-600 active:bg-amber-700 transition shrink-0 self-end"
+                        onClick={() => handleSubmit()}
+                      >
+                        Save
+                      </button>
+                    </div>
+                    <div class="text-[10px] text-slate-400">Cmd+Enter to save &middot; Escape to cancel</div>
+                  </div>
+                );
+              }}
+            </Show>
+            <Show when={() => scriptCapture() === null}>
+              {() => (
+                <form
+                  class="flex gap-2"
+                  onSubmit={(e: Event) => handleSubmit(e)}
+                >
+                  <div class="flex-1 relative">
+                    {/* Suggestions dropdown */}
+                    <Show when={() => suggestions().length > 0}>
+                      {() => (
+                        <div class="absolute bottom-full left-0 right-0 mb-1 bg-white border border-slate-200 rounded-lg shadow-lg overflow-hidden z-50 max-h-60 overflow-y-auto">
+                          <For each={suggestions}>
+                            {(suggestion, index) => (
+                              <div
+                                class={() =>
+                                  index() === selectedSuggestionIndex()
+                                    ? 'px-3 py-1.5 text-sm font-mono cursor-pointer bg-blue-50 text-blue-700'
+                                    : 'px-3 py-1.5 text-sm font-mono cursor-pointer hover:bg-slate-50 text-slate-700'
+                                }
+                                onMouseDown={(e: MouseEvent) => {
+                                  e.preventDefault();
+                                  acceptSuggestion(suggestion);
+                                }}
+                              >
+                                {suggestion}
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      )}
+                    </Show>
+                    <Show when={multiLine}>
+                      {() => {
+                        let overlayRef: HTMLDivElement | undefined;
+                        return (
+                          <div class="flex flex-col gap-1">
+                            <div class="relative">
+                              <div
+                                ref={(el: HTMLDivElement) => { overlayRef = el; el.innerHTML = highlightCommand(inputValue()); }}
+                                class="absolute inset-0 px-3 py-2 text-sm font-mono whitespace-pre-wrap break-words pointer-events-none overflow-hidden"
+                                aria-hidden="true"
+                                style="border: 1px solid transparent; line-height: 1.5;"
+                              />
+                              <textarea
+                                ref={(el: HTMLTextAreaElement) => {
+                                  inputRef.set(el);
+                                  const val = inputValue();
+                                  if (val) { el.value = val; }
+                                  el.focus();
+                                  el.selectionStart = el.selectionEnd = el.value.length;
+                                  // Sync scroll
+                                  el.addEventListener('scroll', () => {
+                                    if (overlayRef) overlayRef.scrollTop = el.scrollTop;
+                                  });
+                                }}
+                                class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono focus:outline-none transition placeholder:text-slate-400 resize-y min-h-[80px] relative"
+                                style="color: transparent; caret-color: #334155; background: transparent; line-height: 1.5;"
+                                rows={4}
+                                placeholder="Type commands (one per line)... Cmd+Enter to run"
+                                onInput={(e: InputEvent) => {
+                                  const val = (e.target as HTMLTextAreaElement).value;
+                                  inputValue.set(val);
+                                  selectedSuggestionIndex.set(-1);
+                                  if (overlayRef) overlayRef.innerHTML = highlightCommand(val);
+                                }}
+                                onKeyDown={(e: KeyboardEvent) => handleInputKeyDown(e)}
+                                onPaste={(e: ClipboardEvent) => handlePaste(e)}
+                              />
+                            </div>
+                            <div class="text-[10px] text-slate-400">Cmd+Enter to run &middot; Escape to collapse</div>
+                          </div>
+                        );
+                      }}
+                    </Show>
+                    <Show when={() => !multiLine()}>
+                      {() => (
+                        <input
+                          ref={(el: HTMLInputElement) => inputRef.set(el)}
+                          class="w-full px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono focus:outline-none transition placeholder:text-slate-400"
+                          placeholder="Type a command or describe what you want..."
+                          value={inputValue}
+                          onInput={(e: InputEvent) => {
+                            inputValue.set((e.target as HTMLInputElement).value);
+                            selectedSuggestionIndex.set(-1);
+                          }}
+                          onKeyDown={(e: KeyboardEvent) => handleInputKeyDown(e)}
+                          onPaste={(e: ClipboardEvent) => handlePaste(e)}
+                        />
+                      )}
+                    </Show>
+                  </div>
+                  <button
+                    type="submit"
+                    class="px-4 py-2 rounded-lg bg-blue-600 text-white text-sm font-medium hover:bg-blue-700 active:bg-blue-800 transition shrink-0"
+                  >
+                    Run
+                  </button>
+                </form>
+              )}
+            </Show>
           </div>
         </div>
       </div>

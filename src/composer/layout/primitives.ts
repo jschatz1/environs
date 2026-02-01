@@ -11,6 +11,8 @@ const LAYOUT_SLOTS: Record<LayoutType, string[]> = {
   center: ['content'],
   tabs: ['content'],
   split: ['left', 'right'],
+  paragraph: ['content'],
+  repeat: ['content'],
 };
 
 export function layoutSlotsForType(type: LayoutType): string[] {
@@ -40,6 +42,10 @@ export function compileLayoutClasses(type: LayoutType, options: Record<string, a
       return compileSplit(options);
     case 'tabs':
       return compileTabs(options);
+    case 'paragraph':
+      return compileParagraph(options);
+    case 'repeat':
+      return compileRepeat(options);
     default:
       return { outer: '', slotWrappers: {} };
   }
@@ -60,7 +66,7 @@ function compileStack(opts: Record<string, any>): LayoutClasses {
   };
 
   const classes = [
-    'flex min-w-0',
+    'flex min-w-0 w-full',
     axis === 'x' ? 'flex-row' : 'flex-col',
     `gap-${gap}`,
     alignMap[align] ?? '',
@@ -138,6 +144,20 @@ function compileSplit(opts: Record<string, any>): LayoutClasses {
 function compileTabs(opts: Record<string, any>): LayoutClasses {
   return {
     outer: 'min-w-0',
+    slotWrappers: { content: 'contents' },
+  };
+}
+
+function compileParagraph(_opts: Record<string, any>): LayoutClasses {
+  return {
+    outer: '',
+    slotWrappers: { content: 'contents' },
+  };
+}
+
+function compileRepeat(_opts: Record<string, any>): LayoutClasses {
+  return {
+    outer: 'contents',
     slotWrappers: { content: 'contents' },
   };
 }

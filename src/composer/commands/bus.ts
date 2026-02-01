@@ -4,6 +4,7 @@ import type { DocumentModel } from '../document/model.js';
 import { createDocument } from '../document/model.js';
 import { applyCommand } from '../document/reducer.js';
 import { createIdState, nextId, type IdState } from '../document/ids.js';
+import { updateIdStateFromDoc } from './compaction.js';
 
 // ---------------------------------------------------------------------------
 // CommandBus — manages command log, undo/redo, and document state
@@ -21,6 +22,7 @@ export interface CommandBus {
   allocId(kind: string): string;
   exportLog(): string;
   importLog(json: string): void;
+  replaceHistory(cmds: DocCommand[]): void;
 }
 
 export function createCommandBus(): CommandBus {
@@ -94,6 +96,29 @@ export function createCommandBus(): CommandBus {
     return JSON.stringify(log, null, 2);
   }
 
+  function replaceHistory(cmds: DocCommand[]): void {
+    undoStack.length = 0;
+    redoStack.length = 0;
+    log.length = 0;
+
+    // Reset ID state
+    const newIdState = createIdState();
+    Object.assign(idState, newIdState);
+
+    batch(() => {
+      let current = createDocument();
+      for (const cmd of cmds) {
+        current = applyCommand(current, cmd);
+        log.push(cmd);
+      }
+      doc.set(current);
+      if (cmds.length > 0) {
+        undoStack.push(cmds);
+      }
+      updateIdStateFromDoc(idState, current);
+    });
+  }
+
   function importLog(json: string): void {
     const cmds: DocCommand[] = JSON.parse(json);
     // Clear everything
@@ -117,6 +142,6 @@ export function createCommandBus(): CommandBus {
 
   return {
     doc, idState, log, undoStack, redoStack,
-    dispatch, undo, redo, allocId, exportLog, importLog,
+    dispatch, undo, redo, allocId, exportLog, importLog, replaceHistory,
   };
 }
