@@ -1,6 +1,7 @@
 import { effect } from '../reactivity/effect.js';
 import { insertChild } from '../rendering/dom.js';
 import { createOwner, setOwner, disposeOwner } from '../lifecycle/ownership.js';
+import { COMPONENT_RESULT } from '../rendering/jsx-runtime.js';
 
 interface MatchProps {
   when: () => unknown;
@@ -21,6 +22,24 @@ export function Match(props: MatchProps): MatchInstance {
   return { when: props.when, children: props.children };
 }
 
+// Unwrap a Match child that may have been wrapped by the JSX runtime.
+// When <Match> goes through jsx(), the MatchInstance object is stored
+// on the wrapper fragment via COMPONENT_RESULT.
+//
+// We cannot duck-type via `.when` because in browsers DocumentFragment
+// extends EventTarget which has its own `when()` method.
+function unwrapMatch(child: unknown): MatchInstance | null {
+  if (child && typeof child === 'object' && COMPONENT_RESULT in (child as any)) {
+    return (child as any)[COMPONENT_RESULT] as MatchInstance;
+  }
+  // Direct MatchInstance (not wrapped by jsx) — only match plain objects,
+  // never DOM nodes which inherit EventTarget.when().
+  if (child && typeof child === 'object' && !(child instanceof Node) && typeof (child as MatchInstance).when === 'function') {
+    return child as MatchInstance;
+  }
+  return null;
+}
+
 export function Switch(props: SwitchProps): Node {
   const container = document.createDocumentFragment();
   const marker = document.createComment('Switch');
@@ -30,10 +49,11 @@ export function Switch(props: SwitchProps): Node {
   let currentOwner: ReturnType<typeof createOwner> | null = null;
 
   effect(() => {
-    const matches = Array.isArray(props.children) ? props.children : [props.children];
+    const raw = Array.isArray(props.children) ? props.children : [props.children];
     let matched: MatchInstance | null = null;
 
-    for (const match of matches) {
+    for (const child of raw) {
+      const match = unwrapMatch(child);
       if (match && match.when()) {
         matched = match;
         break;
